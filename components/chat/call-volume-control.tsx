@@ -70,8 +70,8 @@ export function CallVolumeControl() {
           type="range"
           className="call-volume-slider"
           min={0}
-          max={1}
-          step={0.01}
+          max={5}
+          step={0.05}
           value={volume}
           aria-label="音量"
           onChange={(e) => onChange(Number(e.target.value))}

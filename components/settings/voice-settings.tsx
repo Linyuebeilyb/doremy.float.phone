@@ -5,7 +5,7 @@ import { Plus, Play, Pause, AlertCircle, RefreshCw, FileEdit, Trash2, X, Check, 
 import { SettingsContext } from "../phone-settings-app";
 import type { VoiceApiConfig } from "@/lib/settings-types";
 import { loadVoiceConfigs, saveVoiceConfigs } from "@/lib/settings-storage";
-import { synthesizeSpeech } from "@/lib/tts-service";
+import { synthesizeSpeech, playAudioBlob, getTtsVolume, setTtsVolume } from "@/lib/tts-service";
 import { ConfirmDialog } from "@/components/ui/modal";
 import { Toggle, Input } from "@/components/ui/form";
 import { Alert } from "@/components/ui/feedback";
@@ -26,6 +26,15 @@ const MINIMAX_PITCH_MIN = -12;
 const MINIMAX_PITCH_MAX = 12;
 const MINIMAX_PITCH_STEP = 1;
 const DEFAULT_SPEECH_PITCH = 0;
+// Minimax voice_setting.vol：缺省 1.0 为原声。注意部分模型（如 speech-2.8 系列）
+// 会静默忽略本参数，那种情况下只有客户端播放增益有效。
+const MINIMAX_VOLUME_MIN = 0.5;
+const MINIMAX_VOLUME_MAX = 2.5;
+const MINIMAX_VOLUME_STEP = 0.1;
+const DEFAULT_SPEECH_VOLUME = 1.0;
+// 客户端播放增益上限（与 lib/tts-service.ts 的 TTS_VOLUME_MAX 保持一致）：
+// 100% = 原声，>100% 走限幅器，不会削波。
+const TTS_PLAY_VOLUME_MAX = 5;
 const VOICE_PROVIDER_OPTIONS = [
     { value: "OpenAI", label: "OpenAI TTS" },
     { value: "MinimaxCN", label: "Minimax 语音国内版" },
@@ -207,7 +216,10 @@ function normalizeVoiceConfigs(configs: VoiceApiConfig[]): VoiceApiConfig[] {
             const speechPitch = typeof config.speechPitch === "number" && Number.isFinite(config.speechPitch)
                 ? Math.min(MINIMAX_PITCH_MAX, Math.max(MINIMAX_PITCH_MIN, Math.round(config.speechPitch)))
                 : DEFAULT_SPEECH_PITCH;
-            return { ...config, baseUrl, speechSpeed, speechPitch };
+            const speechVolume = typeof config.speechVolume === "number" && Number.isFinite(config.speechVolume)
+                ? Math.min(MINIMAX_VOLUME_MAX, Math.max(MINIMAX_VOLUME_MIN, config.speechVolume))
+                : DEFAULT_SPEECH_VOLUME;
+            return { ...config, baseUrl, speechSpeed, speechPitch, speechVolume };
         });
 }
 
@@ -240,7 +252,11 @@ export function VoiceSettings() {
     const [manualModelIds, setManualModelIds] = useState<Record<string, boolean>>({});
     const [manualVoiceIds, setManualVoiceIds] = useState<Record<string, boolean>>({});
     const [isLoaded, setIsLoaded] = useState(false);
+    // 角色语音播放音量（客户端增益）：与通话界面右上角的喇叭是同一个值。
+    const [playVolume, setPlayVolume] = useState(1);
     const audioRef = useRef<HTMLAudioElement | null>(null);
+    // 当前试听的播放句柄（Web Audio 链路），再次点击时用来中断
+    const previewAbortRef = useRef<(() => void) | null>(null);
 
     // Fetching states for Voices
     const [isFetching, setIsFetching] = useState<Record<string, boolean>>({});
@@ -258,6 +274,7 @@ export function VoiceSettings() {
             setConfigs(DEFAULT_VOICE_CONFIGS);
             saveVoiceConfigs(DEFAULT_VOICE_CONFIGS);
         }
+        setPlayVolume(getTtsVolume());
         setIsLoaded(true);
     }, []);
 
@@ -511,21 +528,23 @@ export function VoiceSettings() {
         }
     };
 
-    const togglePreview = async (config: VoiceApiConfig) => {
-        if (playingVoiceId === config.id) {
-            if (audioRef.current) {
-                audioRef.current.pause();
-                audioRef.current = null;
-            }
-            setPlayingVoiceId(null);
-            return;
-        }
-
+    const stopPreview = () => {
+        previewAbortRef.current?.();
+        previewAbortRef.current = null;
         if (audioRef.current) {
             audioRef.current.pause();
             audioRef.current = null;
         }
+    };
 
+    const togglePreview = async (config: VoiceApiConfig) => {
+        if (playingVoiceId === config.id) {
+            stopPreview();
+            setPlayingVoiceId(null);
+            return;
+        }
+
+        stopPreview();
         setPlayingVoiceId(config.id);
 
         try {
@@ -537,21 +556,13 @@ export function VoiceSettings() {
                 config,
             );
             if (!blob) throw new Error("当前语音配置未返回真实音频");
-            const url = URL.createObjectURL(blob);
-
-            const audio = new Audio(url);
-            audioRef.current = audio;
-            audio.onended = () => {
-                setPlayingVoiceId(null);
-                audioRef.current = null;
-                URL.revokeObjectURL(url);
-            };
-            audio.onerror = () => {
-                setPlayingVoiceId(null);
-                audioRef.current = null;
-                URL.revokeObjectURL(url);
-            };
-            await audio.play();
+            // 走和真实通话同一条播放链路（Web Audio → 播放增益 → 限幅器）：
+            // 用 <audio> 元素试听最多只能到 100%，听不出「角色语音播放音量」的效果。
+            const handle = playAudioBlob(blob);
+            previewAbortRef.current = handle.abort;
+            await handle.promise;
+            if (previewAbortRef.current === handle.abort) previewAbortRef.current = null;
+            setPlayingVoiceId(null);
         } catch (e: unknown) {
             const msg = e instanceof Error ? e.message : String(e);
             alert(`语音测试失败: ${msg}`);
@@ -565,6 +576,35 @@ export function VoiceSettings() {
         <div className="flex flex-col gap-6">
             <div className="flex items-center">
                 <h2 className="m-0 mx-2 ts-28 font-bold italic leading-none text-black">Voice API</h2>
+            </div>
+
+            <div className="flex flex-col gap-1">
+                <div className="flex items-center justify-between px-1">
+                    <label className="menu-desc">角色语音播放音量</label>
+                    <span className="menu-label font-medium">{Math.round(playVolume * 100)}%</span>
+                </div>
+                <input
+                    type="range"
+                    min={0}
+                    max={TTS_PLAY_VOLUME_MAX}
+                    step={0.05}
+                    value={playVolume}
+                    onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setPlayVolume(v);
+                        setTtsVolume(v);
+                    }}
+                    className="w-full accent-black"
+                    aria-label="角色语音播放音量"
+                />
+                <div className="relative h-4 px-1 text-xs text-gray-500" aria-hidden="true">
+                    <span className="absolute left-1 whitespace-nowrap">0%</span>
+                    <span className="absolute whitespace-nowrap" style={{ left: "20%", transform: "translateX(-50%)" }}>100% 原声</span>
+                    <span className="absolute right-1 whitespace-nowrap">500%</span>
+                </div>
+                <span className="menu-desc ml-1">
+                    用于补偿电平偏低的音源（克隆音色常见），对通话、语音条与漫卷播报同时生效；超过 100% 由限幅器兜底，不会削波。通话界面右上角的喇叭与这里是同一个值。拉得越高，轻声与大声的差距会被压得越小（此时更适合重录一版电平更高的克隆样本）。
+                </span>
             </div>
 
             {configs.length === 0 ? (
@@ -783,6 +823,30 @@ export function VoiceSettings() {
                                                         <span className="absolute whitespace-nowrap" style={{ left: "50%", transform: "translateX(-50%)" }}>0 默认</span>
                                                         <span className="absolute right-1 whitespace-nowrap">+{MINIMAX_PITCH_MAX}</span>
                                                     </div>
+                                                </div>
+                                                <div className="flex flex-col gap-1 -mt-1">
+                                                    <div className="flex items-center justify-between px-1">
+                                                        <label className="menu-desc">音量增益 (Volume)</label>
+                                                        <span className="menu-label font-medium">{(config.speechVolume ?? DEFAULT_SPEECH_VOLUME).toFixed(1)}×</span>
+                                                    </div>
+                                                    <input
+                                                        type="range"
+                                                        min={MINIMAX_VOLUME_MIN}
+                                                        max={MINIMAX_VOLUME_MAX}
+                                                        step={MINIMAX_VOLUME_STEP}
+                                                        value={config.speechVolume ?? DEFAULT_SPEECH_VOLUME}
+                                                        onChange={(e) => updateConfig(config.id, { speechVolume: Number(e.target.value) })}
+                                                        className="w-full accent-black"
+                                                        aria-label="Minimax 音量增益"
+                                                    />
+                                                    <div className="relative h-4 px-1 text-xs text-gray-500" aria-hidden="true">
+                                                        <span className="absolute left-1 whitespace-nowrap">{MINIMAX_VOLUME_MIN.toFixed(1)}×</span>
+                                                        <span className="absolute whitespace-nowrap" style={{ left: "25%", transform: "translateX(-50%)" }}>1.0× 原声</span>
+                                                        <span className="absolute right-1 whitespace-nowrap">{MINIMAX_VOLUME_MAX.toFixed(1)}×</span>
+                                                    </div>
+                                                    <span className="menu-desc ml-1">
+                                                        写进请求的 vol 参数。部分 Minimax 模型（如 speech-2.8 系列）会忽略它——调大没变化时，请改调页面顶部的「角色语音播放音量」。
+                                                    </span>
                                                 </div>
                                                 <div className="flex flex-col gap-1 mt-1">
                                                     <label className="menu-desc ml-1">朗读语言</label>

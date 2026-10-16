@@ -89,6 +89,17 @@ function normalizeMinimaxPitch(pitch: number | undefined): number {
     return Math.min(MINIMAX_PITCH_MAX, Math.max(MINIMAX_PITCH_MIN, Math.round(pitch)));
 }
 
+// 服务端音量增益。缺省 1.0（原声）——不改变既有配置的输出。
+// 实测：speech-2.8 系列会静默忽略 vol（调到 2.0/2.5 听感无变化），
+// 所以「声音偏小」的主力解法是客户端播放增益，这里只是给支持的模型留一个入口。
+const MINIMAX_VOLUME_MIN = 0.5;
+const MINIMAX_VOLUME_MAX = 2.5;
+
+function normalizeMinimaxVolume(volume: number | undefined): number {
+    if (typeof volume !== "number" || !Number.isFinite(volume)) return 1.0;
+    return Math.min(MINIMAX_VOLUME_MAX, Math.max(MINIMAX_VOLUME_MIN, volume));
+}
+
 async function synthesizeMinimax(text: string, config: VoiceApiConfig, emotion?: string): Promise<Blob | null> {
     if (!config.apiKey) throw new Error("Minimax API Key 未配置");
 
@@ -96,7 +107,7 @@ async function synthesizeMinimax(text: string, config: VoiceApiConfig, emotion?:
     const voiceSetting: Record<string, unknown> = {
         voice_id: config.defaultVoice || "male-qn-qingse",
         speed: normalizeMinimaxSpeed(config.speechSpeed),
-        vol: 1.0,
+        vol: normalizeMinimaxVolume(config.speechVolume),
         pitch: normalizeMinimaxPitch(config.speechPitch),
     };
     const normalizedEmotion = emotion?.trim().toLowerCase();
@@ -191,16 +202,19 @@ let _sharedAudio: HTMLAudioElement | null = null;
 let _audioUnlocked = false;
 let _unlockListenerInstalled = false;
 
-// ── In-app TTS volume (0..1) ──
+// ── In-app TTS volume (0..5) ──
 // iOS plays Web Audio on the ringer/voice stream, so the hardware volume keys
 // don't control character speech. This in-app gain does. Synced to localStorage.
+// 1.0 = 原声；>1 用于补偿电平偏低的音源（克隆音色最常见）。Web Audio 路径后面
+// 串了限幅器，所以超过 1 不会削波；媒体元素回落路径上限仍是 1（见下）。
 const TTS_VOLUME_KEY = "ai_phone_tts_volume_v1";
+const TTS_VOLUME_MAX = 5;
 let _ttsVolume = ((): number => {
     if (typeof window === "undefined") return 1;
     try {
         const raw = window.localStorage.getItem(TTS_VOLUME_KEY);
         const v = raw == null ? 1 : Number(raw);
-        return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 1;
+        return Number.isFinite(v) ? Math.min(TTS_VOLUME_MAX, Math.max(0, v)) : 1;
     } catch { return 1; }
 })();
 // Live gain node of the currently-playing AudioContext clip, so the slider can
@@ -212,10 +226,11 @@ export function getTtsVolume(): number {
 }
 
 export function setTtsVolume(volume: number): void {
-    _ttsVolume = Math.min(1, Math.max(0, volume));
+    _ttsVolume = Math.min(TTS_VOLUME_MAX, Math.max(0, volume));
     try { window.localStorage.setItem(TTS_VOLUME_KEY, String(_ttsVolume)); } catch { /* ignore */ }
     if (_activeGain) { try { _activeGain.gain.value = _ttsVolume; } catch { /* ignore */ } }
-    if (_sharedAudio) { try { _sharedAudio.volume = _ttsVolume; } catch { /* ignore */ } }
+    // 媒体元素的 volume 合法区间只有 0..1，>1 会抛 IndexSizeError；那一路放不大。
+    if (_sharedAudio) { try { _sharedAudio.volume = Math.min(1, _ttsVolume); } catch { /* ignore */ } }
 }
 
 // ── 通话音频会话开关 ──
@@ -359,7 +374,7 @@ function playAudioBlobElement(blob: Blob): { promise: Promise<void>; abort: () =
     const url = URL.createObjectURL(blob);
     const audio = getSharedAudio();
     audio.muted = false;
-    audio.volume = _ttsVolume;
+    audio.volume = Math.min(1, _ttsVolume);
     audio.src = url;
 
     let settled = false;
@@ -421,6 +436,7 @@ export function playAudioBlob(blob: Blob): { promise: Promise<void>; abort: () =
     let source: AudioBufferSourceNode | null = null;
 
     let gain: GainNode | null = null;
+    let limiter: DynamicsCompressorNode | null = null;
     let fallbackAbort: (() => void) | null = null;
 
     const cleanupWebAudio = () => {
@@ -431,6 +447,8 @@ export function playAudioBlob(blob: Blob): { promise: Promise<void>; abort: () =
             source = null;
         }
         if (gain) { try { gain.disconnect(); } catch {} }
+        if (limiter) { try { limiter.disconnect(); } catch {} }
+        limiter = null;
         if (_activeGain === gain) _activeGain = null;
         gain = null;
         // Suspend so iOS hands the audio session back to the microphone.
@@ -463,10 +481,19 @@ export function playAudioBlob(blob: Blob): { promise: Promise<void>; abort: () =
                 source = ctx.createBufferSource();
                 source.buffer = audioBuffer;
                 // Route through a gain node so the in-app volume slider applies.
+                // 增益允许 >1（补偿电平偏低的音源），所以后面串一个限幅器：
+                // 峰值被压在接近满刻度处 → 平均电平抬起来而不会削波。
                 gain = ctx.createGain();
                 gain.gain.value = _ttsVolume;
+                limiter = ctx.createDynamicsCompressor();
+                limiter.threshold.value = -1.5;
+                limiter.knee.value = 6;
+                limiter.ratio.value = 20;
+                limiter.attack.value = 0.003;
+                limiter.release.value = 0.25;
                 source.connect(gain);
-                gain.connect(ctx.destination);
+                gain.connect(limiter);
+                limiter.connect(ctx.destination);
                 _activeGain = gain;
                 source.onended = finalize;
                 source.start();

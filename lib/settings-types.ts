@@ -171,6 +171,10 @@ export type VoiceApiConfig = {
     speechSpeed?: number;
     /** Minimax voice_setting.pitch（半音，±12）。缺省保持旧行为（0，原声）。 */
     speechPitch?: number;
+    /** Minimax voice_setting.vol 增益（0.5-2.5，缺省 1.0 原声）。
+     *  注意：部分 Minimax 模型（如 speech-2.8 系列）会静默忽略该参数；
+     *  那种情况下唯一有效的杠杆是设置页顶部的「角色语音播放音量」。 */
+    speechVolume?: number;
     customVoices?: { id: string; name: string; createdAt?: number }[];
     enableSTT: boolean;
     enableTTS: boolean;
