@@ -72,6 +72,17 @@ class PushService : Service() {
     private var notifId = 100
     private var shellSubRegistered = false
 
+    /**
+     * 最近一次 WebSocket 失败的原因，显示在常驻通知上。
+     *
+     * 为什么必须记：onFailure 原本把 Throwable 和 Response 整个丢掉，于是
+     * 「一直重连中」这条故障只能靠外部手段（换网络、看后台日志、试各种配置）
+     * 一层层反推，排查成本极高。记下来之后，通知栏直接就能看到是
+     * TLS 握手失败、HTTP 403、还是连接超时。
+     */
+    @Volatile
+    private var lastFailure: String? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -97,17 +108,26 @@ class PushService : Service() {
         while (!stopped) {
             val config = fetchConfig()
             if (config == null) {
-                updateKeepAlive("未登录或站点不可达，稍后重试")
+                updateKeepAlive("未登录或站点不可达，稍后重试${lastFailureSuffix()}")
                 sleepSec(60); continue
             }
-            updateKeepAlive("已连接，等待角色消息")
+            // 注意：「已连接」不再写在这里。runSocket 是阻塞调用、要等断开才返回，
+            // 旧写法在握手之前就写「已连接」，于是每轮都先假装连上、再改成「重连中」——
+            // 用户看到的状态与实际完全相反。改由 onOpen 回调在真正握手成功后置位。
             val closedNormally = runSocket(config)
             if (stopped) break
-            updateKeepAlive("连接断开，重连中…")
+            updateKeepAlive("连接断开，重连中…${lastFailureSuffix()}")
             sleepSec(if (closedNormally) 3 else backoffSec)
             backoffSec = (backoffSec * 2).coerceAtMost(120)
             if (closedNormally) backoffSec = 5
         }
+    }
+
+    /** 把最近一次失败原因拼成通知的后缀；没有原因时返回空串，保持原本文案。 */
+    private fun lastFailureSuffix(): String {
+        val detail = lastFailure
+        if (detail.isNullOrBlank()) return ""
+        return "（$detail）"
     }
 
     private data class PushConfig(val supabaseUrl: String, val anonKey: String, val userId: String)
@@ -172,6 +192,22 @@ class PushService : Service() {
         }
     }
 
+    /**
+     * 把一次连接失败整理成一句短诊断，直接显示在常驻通知上。
+     *
+     * 组成：HTTP 状态码（握手中断时 OkHttp 才会给）+ 异常类名 + 简短 message。
+     * 只取前 60 字：通知正文本来就显示不全，太长反而把关键的状态码挤掉。
+     */
+    private fun describeFailure(t: Throwable, response: Response?): String {
+        val parts = mutableListOf<String>()
+        val code = response?.code ?: 0
+        if (code > 0) parts.add("HTTP $code")
+        parts.add(t.javaClass.simpleName)
+        val message = t.message?.trim().orEmpty()
+        if (message.isNotEmpty()) parts.add(message.take(60))
+        return parts.joinToString(" · ")
+    }
+
     /** 跑一条 WebSocket 直到断开；返回是否属于正常关闭。 */
     private fun runSocket(config: PushConfig): Boolean {
         val wsUrl = config.supabaseUrl.replaceFirst("http", "ws") +
@@ -183,6 +219,10 @@ class PushService : Service() {
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                // 真正的握手成功在这里，通知文案以此为准（见 connectionLoop 的说明）。
+                // 清掉上一次的失败原因，否则下次断开时会把过时的原因又显示出来。
+                lastFailure = null
+                updateKeepAlive("已连接，等待角色消息")
                 val join = JSONObject()
                     .put("topic", topic)
                     .put("event", "phx_join")
@@ -241,11 +281,23 @@ class PushService : Service() {
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                // 服务端主动踢掉连接时，关闭码是最有价值的线索（1008 策略拒绝、
+                // 1013 稍后重试、1011 服务端内部错误……）。旧代码只记了一个 normal，
+                // 于是「连上就被踢」和「网络断了」在通知上长得一模一样。
+                val trimmedReason = reason.trim()
+                lastFailure = if (trimmedReason.isEmpty()) {
+                    "服务端关闭 $code"
+                } else {
+                    "服务端关闭 $code · ${trimmedReason.take(40)}"
+                }
                 normal = true
                 synchronized(lock) { done = true; lock.notifyAll() }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                // 这里原本把 t 和 response 全丢掉，导致「一直重连中」完全无法排查。
+                // 现在记下异常类型、HTTP 状态码与简短原因，下一条常驻通知会带上。
+                lastFailure = describeFailure(t, response)
                 synchronized(lock) { done = true; lock.notifyAll() }
             }
         }
