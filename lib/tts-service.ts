@@ -43,6 +43,10 @@ export async function synthesizeSpeech(
         return synthesizeOpenAI(text, voiceConfig);
     }
 
+    if (provider === "ElevenLabs") {
+        return synthesizeElevenLabs(text, voiceConfig);
+    }
+
     return null;
 }
 
@@ -182,6 +186,79 @@ async function synthesizeOpenAI(text: string, config: VoiceApiConfig): Promise<B
     if (!response.ok) {
         const errText = await response.text().catch(() => "");
         throw new Error(`OpenAI TTS 请求失败 (${response.status}): ${errText}`);
+    }
+
+    const blob = await response.blob();
+    return new Blob([await blob.arrayBuffer()], { type: "audio/mpeg" });
+}
+
+// ── ElevenLabs TTS ──────────────────────────────────
+//
+// ElevenLabs 与 OpenAI 的 TTS 接口形状完全不同：
+//   POST {base}/text-to-speech/{voice_id}?output_format=mp3_44100_128
+//   头：xi-api-key: <key>
+//   体：{ text, model_id, voice_settings: { stability, similarity_boost, style?, speed? } }
+// 返回裸 mp3 二进制。因此不能复用 OpenAI 那条链路，单独一个函数。
+//
+// 请求由浏览器直发（与 Minimax 同路），跨域依赖 ElevenLabs 侧放行；
+// 若所在网络/版本下被 CORS 拦下，改用自建代理并把地址填进 Base URL 即可。
+
+const DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1";
+// ElevenLabs 单次请求的文本上限随模型不同（约 5k~40k 字符）。这里按最保守的
+// 一档截断，避免长段剧情直接 422 把整句语音吞掉；超长时宁可少念一点也不炸。
+const ELEVENLABS_MAX_CHARS = 4500;
+// voice_settings.speed 的官方区间；超出会 422，所以统一钳制。
+const ELEVENLABS_SPEED_MIN = 0.7;
+const ELEVENLABS_SPEED_MAX = 1.2;
+
+function clamp01(value: number | undefined, fallback: number): number {
+    if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+    return Math.min(1, Math.max(0, value));
+}
+
+async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+    const apiKey = (config.apiKey || "").trim();
+    if (!apiKey) throw new Error("ElevenLabs API Key 未配置");
+
+    const voiceId = (config.defaultVoice || "").trim();
+    if (!voiceId) throw new Error("ElevenLabs 需要填写 Voice ID（在官网 Voices 页面复制）");
+
+    const baseUrl = (config.baseUrl || DEFAULT_ELEVENLABS_BASE_URL).replace(/\/+$/, "");
+    const payloadText = text.length > ELEVENLABS_MAX_CHARS
+        ? text.slice(0, ELEVENLABS_MAX_CHARS)
+        : text;
+
+    const voiceSettings: Record<string, unknown> = {
+        stability: clamp01(config.voiceStability, 0.5),
+        similarity_boost: clamp01(config.voiceSimilarity, 0.75),
+    };
+    // style 0 = 关闭（也是默认）。只在用户显式调高时才发，省一点延迟与额度。
+    const style = clamp01(config.voiceStyle, 0);
+    if (style > 0) voiceSettings.style = style;
+    if (typeof config.speechSpeed === "number" && Number.isFinite(config.speechSpeed)) {
+        voiceSettings.speed = Math.min(ELEVENLABS_SPEED_MAX, Math.max(ELEVENLABS_SPEED_MIN, config.speechSpeed));
+    }
+
+    const response = await fetchWithTimeout(
+        `${baseUrl}/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+        {
+            method: "POST",
+            headers: {
+                "xi-api-key": apiKey,
+                "Content-Type": "application/json",
+                Accept: "audio/mpeg",
+            },
+            body: JSON.stringify({
+                text: payloadText,
+                model_id: config.model || "eleven_multilingual_v2",
+                voice_settings: voiceSettings,
+            }),
+        },
+    );
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`ElevenLabs TTS 请求失败 (${response.status}): ${errText.slice(0, 300)}`);
     }
 
     const blob = await response.blob();

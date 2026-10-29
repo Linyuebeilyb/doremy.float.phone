@@ -176,6 +176,12 @@ export type VoiceApiConfig = {
      *  那种情况下唯一有效的杠杆是设置页顶部的「角色语音播放音量」。 */
     speechVolume?: number;
     customVoices?: { id: string; name: string; createdAt?: number }[];
+    /** ElevenLabs voice_settings.stability（0-1，缺省 0.5）：越低越有起伏，越高越稳。 */
+    voiceStability?: number;
+    /** ElevenLabs voice_settings.similarity_boost（0-1，缺省 0.75）：越贴近原始音色。 */
+    voiceSimilarity?: number;
+    /** ElevenLabs voice_settings.style（0-1，缺省 0 = 关闭）：非 0 更贴文本表演，但延迟更高。 */
+    voiceStyle?: number;
     enableSTT: boolean;
     enableTTS: boolean;
 };
