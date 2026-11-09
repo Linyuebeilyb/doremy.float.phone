@@ -1,7 +1,8 @@
-// v13：本次升版是为了强制作废旧缓存。
-// 折叠逻辑的修复已进 main，但客户端仍在跑旧 JS —— /_next/static/ 走 cache-first，
-// 旧包会被一直留在 RUNTIME_CACHE 里。升 CACHE_VERSION 会在 activate 时整批清空。
-const CACHE_VERSION = "ai-phone-pwa-v13";
+// 客户端在跑旧 JS 时，升 CACHE_VERSION 会在 activate 时整批清空旧缓存。
+//   v13：修复折叠逻辑后旧包仍留在 RUNTIME_CACHE 里，升版强制作废。
+//   v14：语音新增 ElevenLabs 服务商已部署，但 /_next/static/ 走 cache-first，
+//        客户端一直命中 v13 时期的旧 JS，设置里看不到新服务商，且关后台重开无效。
+const CACHE_VERSION = "ai-phone-pwa-v14";
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
