@@ -5,31 +5,32 @@ import { useEffect } from "react";
 /**
  * 移除 Netlify 在响应 HTML 时注入的「Powered by Netlify」角标。
  *
- * 为什么用 JS 而不是纯 CSS：
- * 这个角标不在本仓库代码里，由 Netlify 服务端注入，它的标签名/类名没有公开
- * 契约、且会随版本变化。先前用一组猜测的选择器（#netlify-badge 等）实测未
- * 命中，说明猜不中。改成「按可见文本定位，再向上找浮层容器」——不依赖任何
- * 类名，Netlify 改样式也不影响。
+ * 为什么不用纯 CSS：
+ * 角标不在本仓库代码里，由 Netlify 注入，标签名/类名没有公开契约且会随版本
+ * 变化。先按猜测的选择器（#netlify-badge / .netlify-badge 等）实测未命中。
+ *
+ * 为什么按「元素整体文本」而不是逐文本节点匹配：
+ * 角标的文案常常被拆进多个节点（"Powered by" 一段、"Netlify" 加粗一段，
+ * 中间还可能夹图标元素）。逐个 Text 节点做正则匹配时，任何单个节点都凑不出
+ * 完整句子，命中数恒为 0——这是上一版在普通 DOM 上也没生效的直接原因。
+ * 这里改成读元素的 textContent 整体判断，再取「最外层」的命中元素隐藏。
  *
  * 安全边界（避免误伤界面）：
- * - 只处理文本命中「powered by netlify」的元素；
- * - 向上最多 6 层找 fixed/absolute 定位的祖先；
- * - 且该祖先的尺寸必须像「角标」（高度 ≤ 120px、宽度 ≤ 420px），
- *   否则回退到文本的直接父元素，绝不隐藏整页容器。
- *
- * 同时用 MutationObserver 兜住「页面加载后才插入」的情况，并做了节流，
- * 避免频繁 DOM 变化造成重复全量扫描。
+ * - 元素文本长度上限 120 字，整页容器天然被排除；
+ * - 取「父元素不再命中」的最外层节点作为隐藏目标；
+ * - 目标尺寸必须像角标（高 ≤160px、宽 ≤500px），否则退回到更内层的命中元素；
+ * - 全程 try/catch，清理失败不影响页面本身。
  */
 
-const BADGE_TEXT = /powered\s+by\s+netlify/i;
+const BADGE_TEXT = /powered\s*by\s*netlify/i;
 const HIDE_ATTR = "data-netlify-badge-hidden";
-const MAX_BADGE_HEIGHT = 120;
-const MAX_BADGE_WIDTH = 420;
-const MAX_ANCESTOR_DEPTH = 6;
+const MAX_TEXT_LENGTH = 120;
+const MAX_BADGE_HEIGHT = 160;
+const MAX_BADGE_WIDTH = 500;
 const MAX_SHADOW_DEPTH = 3;
 const SWEEP_THROTTLE_MS = 400;
-// 首次加载后的补扫时点：Netlify 可能用 script 延迟把角标插进来
-const INITIAL_RETRY_DELAYS_MS = [300, 1200, 3000];
+// 首次加载后的补扫时点：注入脚本可能晚于 React 挂载
+const INITIAL_RETRY_DELAYS_MS = [300, 1000, 2500, 5000];
 
 function hide(el: HTMLElement): void {
     if (el.hasAttribute(HIDE_ATTR)) return;
@@ -39,75 +40,44 @@ function hide(el: HTMLElement): void {
     el.style.setProperty("pointer-events", "none", "important");
 }
 
+function matchesBadgeText(el: Element): boolean {
+    const text = el.textContent;
+    if (!text || text.length > MAX_TEXT_LENGTH) return false;
+    return BADGE_TEXT.test(text);
+}
+
 function looksLikeBadge(el: HTMLElement): boolean {
     const rect = el.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return false;
     return rect.height <= MAX_BADGE_HEIGHT && rect.width <= MAX_BADGE_WIDTH;
 }
 
-/**
- * 从命中文本的元素向上找「浮动的、体积像角标」的容器；找不到就用它本身。
- *
- * 需要能穿过 shadow 边界：角标若在 shadow root 里，向上找到根就会 parentElement
- * 为 null，此时只有把宿主元素（host）藏掉才有效——只藏 shadow 内部的子孙，
- * 宿主本身可能仍占位或继续渲染。
- */
-function findBadgeContainer(start: HTMLElement): HTMLElement {
-    let node: HTMLElement | null = start;
-    for (let depth = 0; node && depth < MAX_ANCESTOR_DEPTH; depth += 1) {
-        if (node === document.body) return start;
-        const position = window.getComputedStyle(node).position;
-        if ((position === "fixed" || position === "absolute") && looksLikeBadge(node)) {
-            return node;
-        }
-        if (node.parentElement) {
-            node = node.parentElement;
-            continue;
-        }
-        // 到顶了：当前节点若是 shadow root 的顶层元素，改用它的宿主
-        const root = node.getRootNode();
-        const host = (root as ShadowRoot).host;
-        if (host instanceof HTMLElement) {
-            node = host;
-            continue;
-        }
-        return start;
-    }
-    return start;
+/** 命中元素里取「最外层」的那个：父元素不再命中就是它。 */
+function isOutermostHit(el: Element): boolean {
+    const parent = el.parentElement;
+    return !parent || !matchesBadgeText(parent);
 }
 
 /**
- * 在给定根节点内找含角标文本的元素。
- *
- * 必须自己递归 shadow root：TreeWalker / querySelectorAll 都不会穿过 shadow 边界，
- * 而「角标浮在所有图层之上、按文字也扫不到」正是 shadow DOM 的典型症状
- *（宿主元素通常也没有可识别的类名，CSS 选择器同样够不着）。
+ * 递归收集某个根（文档 / shadow root / iframe 文档）内的角标元素。
+ * TreeWalker 与 querySelectorAll 都不穿过 shadow 边界，必须显式递归。
  */
 function collectHits(root: Document | ShadowRoot | HTMLElement, hits: HTMLElement[], depth: number): void {
     if (depth > MAX_SHADOW_DEPTH) return;
 
-    const walker = root.ownerDocument
-        ? root.ownerDocument.createTreeWalker(root as Node, NodeFilter.SHOW_TEXT)
-        : document.createTreeWalker(root as Node, NodeFilter.SHOW_TEXT);
-    let node: Node | null;
-    while ((node = walker.nextNode())) {
-        const value = node.nodeValue;
-        if (!value || !BADGE_TEXT.test(value)) continue;
-        const parent = node.parentElement;
-        if (parent) hits.push(parent);
-    }
+    const scope = root as ParentNode;
+    const elements = scope.querySelectorAll?.("*");
+    if (!elements) return;
 
-    // 递归进 shadow root（open 才能拿到；closed 的取不到，只能靠 CSS 兜底）
-    const elements = (root as ParentNode).querySelectorAll?.("*");
-    if (elements) {
-        elements.forEach(el => {
-            const shadow = (el as HTMLElement).shadowRoot;
-            if (shadow) collectHits(shadow, hits, depth + 1);
-        });
-    }
+    elements.forEach(el => {
+        if (el instanceof HTMLElement && matchesBadgeText(el) && isOutermostHit(el)) {
+            hits.push(el);
+        }
+        const shadow = (el as HTMLElement).shadowRoot;
+        if (shadow) collectHits(shadow, hits, depth + 1);
+    });
 }
 
-/** 同源 iframe 内部文档一起扫；跨域的读不到，按 src 兜底隐藏。 */
 function sweepFrames(hits: HTMLElement[]): void {
     document.querySelectorAll<HTMLIFrameElement>("iframe").forEach(frame => {
         if (/netlify\.com/i.test(frame.getAttribute("src") || "")) {
@@ -131,7 +101,8 @@ function sweep(): void {
     sweepFrames(hits);
 
     for (const hit of hits) {
-        hide(findBadgeContainer(hit));
+        // 优先隐藏尺寸像角标的那个；不像就退回命中元素本身，绝不向上吞掉整页
+        hide(looksLikeBadge(hit) ? hit : (hit.parentElement instanceof HTMLElement && looksLikeBadge(hit.parentElement) ? hit.parentElement : hit));
     }
 }
 
@@ -140,24 +111,23 @@ export function NetlifyBadgeRemover() {
         let disposed = false;
         let timer: number | null = null;
 
+        const runSweep = () => {
+            try {
+                sweep();
+            } catch {
+                // 清理失败绝不能影响页面本身
+            }
+        };
+
         const schedule = () => {
             if (disposed || timer !== null) return;
             timer = window.setTimeout(() => {
                 timer = null;
-                try {
-                    sweep();
-                } catch {
-                    // 清理失败绝不能影响页面本身
-                }
+                runSweep();
             }, SWEEP_THROTTLE_MS);
         };
 
-        // 立即扫一次（此时角标通常已在 HTML 里），再补几次应对延迟注入
-        try {
-            sweep();
-        } catch {
-            /* ignore */
-        }
+        runSweep();
         const retryTimers = INITIAL_RETRY_DELAYS_MS.map(ms => window.setTimeout(schedule, ms));
 
         const observer = new MutationObserver(schedule);
