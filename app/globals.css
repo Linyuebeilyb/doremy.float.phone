@@ -48,18 +48,11 @@
 }
 
 /* ── 隐藏 Netlify 注入的「Powered by Netlify」角标 ──
- * 该浮层由 Netlify 在响应 HTML 时服务端注入（不在本仓库代码里），固定贴在
- * 左下角，会盖住手机桌面底部 Dock，影响使用。这里是纯视觉层面盖掉它：
- * 用多重选择器覆盖已知/可能的注入形态（自定义元素、固定 id、指向 netlify.com
- * 的推广链接），加 !important 避免被注入样式覆盖。
- * 若未来 Netlify 改了注入方式导致失效，去 DevTools 里取新选择器补在这里即可。 */
-#netlify-badge,
-.netlify-badge,
-[data-netlify-badge],
-netlify-badge,
-a[href^="https://www.netlify.com"][target="_blank"],
-iframe[src*="netlify.com"] {
+ * 该浮层由 Netlify 在响应 HTML 时服务端注入（不在本仓库代码里），贴在左下角、
+ * 会盖住手机桌面底部 Dock。标签名/类名没有公开契约且随版本变化——原先按猜测
+ * 的选择器实测未命中，因此改由 NetlifyBadgeRemover 组件按可见文本定位（见
+ * components/netlify-badge-remover.tsx）。这里只留一个死链兜底，纯 CSS 覆盖
+ * 那些确定是推广链接的形态，不影响正常内容。 */
+a[href^="https://www.netlify.com"][target="_blank"] {
   display: none !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
 }

@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { ChatPluginBootstrap } from "@/components/chat-plugin-bootstrap";
 import { ChatReasoningVisibilityController } from "@/components/chat-reasoning-visibility-controller";
 import { CSSImportEnhancer } from "@/components/css-import-enhancer";
+import { NetlifyBadgeRemover } from "@/components/netlify-badge-remover";
 import { PWAManifestInjector } from "@/components/pwa-manifest-injector";
 import { PWARegistrar } from "@/components/pwa-registrar";
 import "../styles/fonts.css";
@@ -47,6 +48,7 @@ export default function RootLayout({
         <PWAManifestInjector />
         <PWARegistrar />
         <CSSImportEnhancer />
+        <NetlifyBadgeRemover />
         <ChatPluginBootstrap />
         <ChatReasoningVisibilityController />
         {children}
