@@ -5,6 +5,8 @@
 # Keep this marker with the story tail-editor release so Netlify receives a
 # conventional config-file change and performs a fresh production build.
 # story-tail-editor-modal: 2026-09-11
+# build-trigger: 2026-11-09 —— 用 Git 触发的构建（而非后台手动 Trigger deploy），
+# 用于验证「Powered by Netlify」角标是否只跟着手动部署出现。无功能改动。
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"
